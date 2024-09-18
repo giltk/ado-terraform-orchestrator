@@ -245,10 +245,10 @@ jobs:
       upload_pr_comment_artifact "$messageToPullrequest"
     env:
       AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
-      NONPROD_CLIENT_ID: $(ARM_CLIENT_ID)
-      NONPROD_TENANT_ID: $(ARM_TENANT_ID)
-      PROD_CLIENT_ID: $(ARM_CLIENT_ID)
-      PROD_TENANT_ID: $(ARM_TENANT_ID)
+      NONPROD_CLIENT_ID: $(NONPROD_CLIENT_ID)
+      NONPROD_TENANT_ID: $(NONPROD_TENANT_ID)
+      PROD_CLIENT_ID: $(PROD_CLIENT_ID)
+      PROD_TENANT_ID: $(PROD_TENANT_ID)
     failOnStderr: true
     displayName: 'Terraform plan for multiple projects'
     name: 'terraform_plan_step'
