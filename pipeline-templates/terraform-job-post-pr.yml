@@ -1,0 +1,75 @@
+jobs:
+- job: post_pr_comment
+  displayName: Post PR comment
+  variables:
+    messageToPullrequest: $[ coalesce(dependencies.terraform_plan.outputs['terraform_plan_step.messageToPullrequest'], dependencies.terraform_apply.outputs['terraform_apply_step.messageToPullrequest'], dependencies.terraform_unlock.outputs['terraform_unlock_step.messageToPullrequest'], dependencies.terraform_state.outputs['terraform_state_step.messageToPullrequest']) ] 
+    pullRequestId: $[ coalesce(dependencies.terraform_plan.outputs['terraform_plan_step.pullRequestId'], dependencies.terraform_apply.outputs['terraform_apply_step.pullRequestId'], dependencies.terraform_unlock.outputs['terraform_unlock_step.pullRequestId'], dependencies.terraform_state.outputs['terraform_state_step.pullRequestId']) ]
+  condition: or(variables['messageToPullrequest'], False)
+  dependsOn: 
+  - terraform_plan
+  - terraform_apply
+  - terraform_unlock
+  steps:
+  - script: |
+      ### functions ###
+      # post comments to an existing pull request
+      post_pr_comment() {
+        local message="$1"
+
+        # Escape special characters in the message
+        local escaped_content=$(echo -e "$message" | jq -Rs .)
+
+        # Prepare the JSON body for the PR comment
+        local body=$(
+        cat <<EOF
+        {
+          "comments": [
+            {
+              "parentCommentId": 0,
+              "content": $escaped_content,
+              "commentType": "text"
+            }
+          ],
+          "status": "closed"
+        }
+      EOF
+        )
+        # Construct the URL for the Azure DevOps API call
+        local url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/git/repositories/$(Build.Repository.Name)/pullRequests/$(pullRequestId)/threads?api-version=7.1"
+
+        # Make the API call to post the comment
+        local response=$(curl -s -L -w "%{http_code}" -X POST -H "Authorization: Bearer $AZURE_DEVOPS_EXT_PAT" -H "Content-Type: application/json" -d "$body" "$url")
+        local http_code=${response: -3}
+        local content=${response:0:-3}
+
+        if [ $http_code -ge "400" ] || [ $http_code -eq "000" ]; then
+          echo -e "curl error:\n${content}" >&2
+        fi
+      }
+      # function to convert terraform plan with ansi codes to markdown
+      convert_ansi_to_markdown() {
+        local input="$1"
+
+        # Convert ANSI escape codes to Markdown-style HTML
+        input=$(echo "$input" | sed -E 's/\x1b\[32m([^[:cntrl:]]*)(\x1b\[[0-9]*m)?/<span style="color: green">\1<\/span>\2/g')
+        input=$(echo "$input" | sed -E 's/\x1b\[31m([^[:cntrl:]]*)(\x1b\[[0-9]*m)?/<span style="color: red">\1<\/span>\2/g')
+        input=$(echo "$input" | sed -E 's/\x1b\[33m([^[:cntrl:]]*)(\x1b\[[0-9]*m)?/<span style="color: yellow">\1<\/span>\2/g')
+        input=$(echo "$input" | sed -E 's/\x1b\[90m([^[:cntrl:]]*)(\x1b\[[0-9]*m)?/<span style="color: gray">\1<\/span>\2/g')
+        input=$(echo "$input" | sed -E 's/\x1b\[1m([^[:cntrl:]]*)(\x1b\[[0-9]*m)?/<span style="font-weight: bold">\1<\/span>\2/g')
+        input=$(echo "$input" | sed -E 's/\x1b\[4m([^[:cntrl:]]*)(\x1b\[[0-9]*m)?/<span style="text-decoration: underline">\1<\/span>\2/g')
+        input=$(echo "$input" | sed -E 's/\x1b\[0m//g')
+
+        echo "$input"
+      }
+      echo "downloading pull request artifact message"
+      az pipelines runs artifact download --artifact-name "$(messageToPullrequestArtifact)" --path "message-to-pullrequest" --run-id "$(Build.BuildId)"
+      # save the content of the message
+      message=$(cat "message-to-pullrequest/$(messageToPullrequestArtifact)")
+      # convert ANSI escape code in message
+      ansi_converted=$(convert_ansi_to_markdown "$message")
+      # post pull request comment
+      echo "posting message as a pullrequest comment"
+      post_pr_comment "$ansi_converted"
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+    displayName: post pr comment functions

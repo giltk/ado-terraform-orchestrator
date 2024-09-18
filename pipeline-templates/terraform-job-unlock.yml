@@ -1,0 +1,94 @@
+jobs:
+- job: terraform_unlock
+  displayName: terraform unlock
+  condition: eq(variables['commandVar'], 'unlock' )
+  steps:
+  - script: |
+      ### functions ###
+      upload_pr_comment_artifact() {
+        local messageToPullrequest="$1"
+        # upload message to pull request artifact
+        echo "##vso[task.setvariable variable=messageToPullrequest;isoutput=true]True"
+        # create tmp file for artifact upload
+        echo "$messageToPullrequest" > $(messageToPullrequestArtifact)
+        az pipelines runs artifact upload --artifact-name "$(messageToPullrequestArtifact)" --path "$(realpath $(messageToPullrequestArtifact))" --run-id "$(Build.BuildId)"
+        # remove tmp file
+        rm $(messageToPullrequestArtifact)
+      }
+
+      ### PullRequest lock mechanism ###
+      # if pullRequestIdVar is not 0, then it was manually inputed - use that
+      if [ $(pullRequestIdVar) != "0" ]; then
+        pullRequestId=$(pullRequestIdVar)
+      else
+        # pull 'all' prs also those closed/completed etc
+        pullRequestId=$(az repos pr list --repository "$(Build.Repository.Name)" --source-branch "$(sourceBranch)" --target-branch "$(targetBranch)" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --status all --query "[0].pullRequestId" -o tsv)
+      fi
+
+      if [ -z $pullRequestId ]; then
+        echo "Pull request id not found, make sure there was any PR for the source branch ($(sourceBranch))"
+        exit 1
+      fi
+
+      # publish variable for future jobs
+      echo "##vso[task.setvariable variable=pullRequestId;isoutput=true]$pullRequestId"
+
+      # get correct variable group id from name:
+      variableGroupId=$(az pipelines variable-group list | jq -r ".[] | select(.name==\"$(variableGroupName)\") | .id")
+      if [ -z "$variableGroupId" ]; then
+        echo "Failed to retrieve variable group id, verify 'variableGroupName'"
+        messageToPullrequest="terraform apply Failed: failed to retrieve variable group id"
+        # call upload_pr_comment_artifact function
+        upload_pr_comment_artifact "$messageToPullrequest"
+        exit 1
+      fi
+
+      # get if repository is already locked
+      terraformRepoLockKey="terraform-$(Build.Repository.ID)-lock"
+      terraformRepoLockValue=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformRepoLockKey\"].value // empty")
+      if [ -n "$terraformRepoLockValue" ]; then
+        echo "existing terraform lock for repository was found, verifying PR lock" 
+        if [ "$terraformRepoLockValue" != "$pullRequestId" ]; then
+          echo "existing terraform plan belongs to a different PR, exiting pipeline"
+          messageToPullrequest="terraform unlock failed: This repository is currently locked by an unapplied plan from pull !$terraformRepoLockValue"
+          # call upload_pr_comment_artifact function
+          upload_pr_comment_artifact "$messageToPullrequest"
+          exit 1
+        else
+          # remove all locks and variables for this PR
+          az pipelines variable-group variable delete --group-id "$variableGroupId" --name "$terraformRepoLockKey" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --yes > /dev/null
+          echo "found lock for current pr, removing all variables"
+          terraformRepoProjectsKey="terraform-$(Build.Repository.ID)-projects"
+          terraformRepoProjectsValue=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformRepoProjectsKey\"].value // empty")
+          # if found continue to delete specific projects plan variables
+          if [ -n $terraformRepoProjectsValue ]; then
+            # found concated project plan variable, delete it
+            az pipelines variable-group variable delete --group-id "$variableGroupId" --name "$terraformRepoProjectsKey" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --yes > /dev/null
+            # create an array from the concated terraform project string
+            IFS=';' read -ra projectList <<< "$terraformRepoProjectsValue"
+            for terraformProject in "${projectList[@]}"; do
+              # verify if project plan exist, if so delete it
+              terraformProjectPlanKey="terraform-$(Build.Repository.ID)-$terraformProject-plan"
+              terraformPlanArtifactName=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformProjectPlanKey\"].value // empty")
+              if [ -n "$terraformPlanArtifactName" ]; then
+                # found project plan variable, delete it
+                az pipelines variable-group variable delete --group-id "$variableGroupId" --name "$terraformProjectPlanKey" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --yes > /dev/null
+              fi
+            done
+          fi
+          messageToPullrequest="terraform unlock success: removed all locks and varaibles for this Pull request"
+          # call upload_pr_comment_artifact function
+          upload_pr_comment_artifact "$messageToPullrequest"
+        fi
+      else
+          echo "no existing terraform lock found, exiting pipeline"
+          messageToPullrequest="terraform unlock failed: This repository doesnt have an active plan from this pr"
+          # call upload_pr_comment_artifact function
+          upload_pr_comment_artifact "$messageToPullrequest"
+          exit 1
+      fi
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+    failOnStderr: true
+    displayName: 'Terraform unlock for pull request'
+    name: 'terraform_unlock_step'

@@ -1,0 +1,254 @@
+jobs:
+- job: terraform_plan
+  displayName: terraform plan
+  condition: eq(variables['commandVar'], 'plan' )
+  steps:
+  - checkout: self
+    persistCredentials: true
+    fetchDepth: 0
+
+  - script: |
+      ### functions ###
+      upload_pr_comment_artifact() {
+        local messageToPullrequest="$1"
+        # upload message to pull request artifact
+        echo "##vso[task.setvariable variable=messageToPullrequest;isoutput=true]True"
+        # create tmp file for artifact upload
+        echo "$messageToPullrequest" > $(messageToPullrequestArtifact)
+        az pipelines runs artifact upload --artifact-name "$(messageToPullrequestArtifact)" --path "$(realpath $(messageToPullrequestArtifact))" --run-id "$(Build.BuildId)"
+        # remove tmp file
+        rm $(messageToPullrequestArtifact)
+      }
+
+      ### PullRequest lock mechanism ###
+      # if pullRequestIdVar is not 0, then it was manually inputed - use that
+      echo "pullrequestIdVar is: $(pullRequestIdVar)"
+      if [ $(pullRequestIdVar) != "0" ]; then
+        pullRequestId="$(pullRequestIdVar)"
+      else
+        pullRequestId=$(az repos pr list --repository "$(Build.Repository.Name)" --source-branch "$(sourceBranch)" --target-branch "$(targetBranch)" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --query "[0].pullRequestId" -o tsv)
+        if [ -z $pullRequestId ]; then
+          echo "Pull request id not found, make sure there is an active PR for the source branch ($(sourceBranch))"
+          exit 1
+        fi
+      fi
+
+
+      # publish variable for future jobs
+      echo "##vso[task.setvariable variable=pullRequestId;isoutput=true]$pullRequestId"
+
+      # get correct variable group id from name:
+      variableGroupId=$(az pipelines variable-group list | jq -r ".[] | select(.name==\"$(variableGroupName)\") | .id")
+      if [ -z "$variableGroupId" ]; then
+        echo "Failed to retrieve variable group id"
+        messageToPullrequest="terraform plan Failed: failed to retrieve variable group id"
+        # call upload_pr_comment_artifact function
+        upload_pr_comment_artifact "$messageToPullrequest"
+        exit 1
+      fi
+
+      # get if repository is already locked
+      terraformRepoLockKey="terraform-$(Build.Repository.ID)-lock"
+      terraformRepoLockValue=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformRepoLockKey\"].value // empty")
+
+      if [ -n "$terraformRepoLockValue" ]; then
+        echo "existing terraform lock for repository was found, verifying PR lock" 
+        # update existing terraform variable group variables 
+        variableGroupSubCommand="update"
+        if [ "$terraformRepoLockValue" != "$pullRequestId" ]; then
+          echo "existing terraform plan belongs to a different PR, exiting pipeline"
+          messageToPullrequest="Plan Failed: This repository is currently locked by an unapplied plan from pull !$terraformRepoLockValue"
+          # call upload_pr_comment_artifact function
+          upload_pr_comment_artifact "$messageToPullrequest"
+          exit 1
+        else
+          echo "existing terraform plan was found, regenerating a new plan"
+        fi
+      else
+        echo "no existing terraform plan was found, generating a plan"
+        # create new terraform variable group variables 
+        variableGroupSubCommand="create"
+      fi
+
+      ### generate terraform projects ###
+
+      echo "generating terraform projects using git diff"
+
+      targetBranch="$(targetBranch)"
+      sourceBranch="$(sourceBranch)"
+
+      # Remove refs/heads/ prefix from branch names
+      targetBranch="${targetBranch#refs/heads/}"
+      sourceBranch="${sourceBranch#refs/heads/}"
+
+      # Generate a list of changed .tf files between the current branch and the main branch
+      changedFiles=$(git diff --name-only origin/$targetBranch...origin/$sourceBranch -- '*.tf' '*.tfvars' '*.tpl' '*.yaml' '*.json')
+
+      # Initialize an empty array to hold the directories with changes
+      declare -A changedDirs
+
+      # Iterate over the changed files and extract the directories
+      while IFS= read -r file; do
+          # Extract the directory of the changed file
+          curDir=$(dirname "$file")
+          
+          if [[ "$curDir" == *modules/* ]]; then
+              # If the directory contains modules/, look one level above
+              parentDir=$(dirname "$curDir")
+              grandparentDir=$(dirname "$parentDir")
+              if [[ -f "$grandparentDir/main.tf" || -f "$grandparentDir/modules.tf" ]]; then
+                  # Add the grandparent directory to the associative array if main.tf exists
+                  changedDirs["$grandparentDir"]=1
+              fi
+          else
+              # Add the directory to the associative array
+              changedDirs["$curDir"]=1
+          fi
+      done <<< "$changedFiles"
+
+      # concat all changed dirs to string 'changedDirsConcat'
+      changedDirsConcat=$(printf "%s;" "${!changedDirs[@]}")
+
+      # set terraformProjects and terraformRepoLock in the terraform variable group
+      echo "$variableGroupSubCommand terraformRepolock and terraformRepoProjects variables in variable group $(variableGroupName)"
+      terraformRepoProjectsKey="terraform-$(Build.Repository.ID)-projects"
+      az pipelines variable-group variable $variableGroupSubCommand --group-id "$variableGroupId" --name "$terraformRepoProjectsKey" --value "$changedDirsConcat" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" > /dev/null
+      az pipelines variable-group variable $variableGroupSubCommand --group-id "$variableGroupId" --name "$terraformRepoLockKey" --value $pullRequestId --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" > /dev/null
+
+      ### start projects loop ###
+      messageToPullrequest=""
+      allPlanSucceeded=true
+      for terraformProject in "${!changedDirs[@]}"; do
+        echo "starting terraform project loop for project $terraformProject"
+        # add newlines to messageToPullrequest if it already holds data
+        if [ -n "$messageToPullrequest" ]; then
+          messageToPullrequest="${messageToPullrequest}\n\n"
+        fi
+
+        # init terraform variable group keys
+        terraformProjectPlanKey="terraform-$(Build.Repository.ID)-$terraformProject-plan"
+        terraformPlanArtifactName="terraform-plan-$(Build.Repository.ID)-$terraformProject-$(Build.BuildId)"
+
+        # prefix for the message in pull requests
+        messageToPullrequestPrefix="Ran plan for dir: \`$terraformProject\`.\n\n"
+        # get the environment from the terraformProject
+        environment=$(echo "$terraformProject" | awk -F/ '{print $2}')
+        # use indirect referencing to get the correct client id and tenant and set them for terraform
+        clientIdVar="${environment^^}_CLIENT_ID"
+        tenantIdVar="${environment^^}_TENANT_ID"
+        export ARM_CLIENT_ID="${!clientIdVar}"
+        export ARM_TENANT_ID="${!tenantIdVar}"
+
+        # Set up a URL for the Azure DevOps API endpoint to get the OIDC token from
+        # Url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/distributedtask/hubs/build/plans/$(System.PlanId)/jobs/$(System.JobId)/oidctoken?serviceConnectionId=$(ADO_SERVICE_CONNECTION)&api-version=7.1-preview.1"
+        Url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/distributedtask/hubs/build/plans/$(System.PlanId)/jobs/$(System.JobId)/oidctoken?api-version=7.1-preview.1"
+
+        # Get the OIDC token
+        response=$(curl -s -X POST -H "Authorization: Bearer $AZURE_DEVOPS_EXT_PAT" -H "Content-Type: application/json" --data '' "$Url")
+
+        OidcToken=$(echo "$response" | jq -r .oidcToken)
+
+        if [ -z "$OidcToken" ]; then
+          echo "Failed to retrieve OIDC token"
+          messageToPullrequest+="${messageToPullrequestPrefix} Plan failed: Failed to retrieve OIDC token"
+          allPlanSucceeded=false
+          continue
+        fi
+
+        # export remaining terraform env
+        export ARM_USE_OIDC=true
+        export ARM_OIDC_TOKEN=$OidcToken
+
+        # change directory to the default working directory
+        cd $(System.DefaultWorkingDirectory)
+
+        # changing directory to current project
+        cd $terraformProject
+
+        echo "performing terraform fmt for project $terraformProject"
+        commandOutput=$(terraform fmt -recursive -check)
+        if [ $? -ne 0 ]; then
+          echo -e "error: terraform fmt failed because of these files:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Plan Failed: terraform fmt failed because of these files:\n<pre>${commandOutput}</pre>"
+          allPlanSucceeded=false
+          continue
+        fi
+
+        echo "performing terraform init for project $terraformProject"
+        commandOutput=$(terraform init 2>&1)
+        if [ $? -ne 0 ]; then
+          echo -e "error: terraform init failed:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Plan Failed: terraform init failed:\n<pre>${commandOutput}</pre>"
+          allPlanSucceeded=false
+          continue
+        fi
+
+        echo "performing terraform validate for project $terraformProject"
+        commandOutput=$(terraform validate 2>&1)
+        if [ $? -ne 0 ]; then
+          echo -e "error: terraform validate failed:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Plan Failed: terraform validate failed:\n<pre>${commandOutput}</pre>"
+          allPlanSucceeded=false
+          continue
+        fi
+
+        echo "performing tflint for project $terraformProject"
+        tflint --init > /dev/null
+        commandOutput=$(tflint --call-module-type=all 2>&1)
+        if [ $? -ne 0 ]; then
+          echo -e "error: tflint failed:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Plan Failed: tflint failed:\n<pre>${commandOutput}</pre>"
+          allPlanSucceeded=false
+          continue
+        fi
+
+        echo "performing terraform plan for project $terraformProject"
+        commandOutput=$(terraform plan -out plan.tfplan $(flagsVar) 2>&1)
+        if [ $? -ne 0 ]; then
+          echo -e "error: terraform plan failed:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Plan Failed: terraform plan failed:\n<pre>${commandOutput}</pre>"
+          allPlanSucceeded=false
+          continue
+        fi
+        
+        # output plan command if parameter is set
+        if $(terraformOutputToLogsVar); then
+          echo -e "terraform plan:\n\n$commandOutput"
+        fi
+
+        # upload terraform project plan artifact
+        echo "uploading terraform plan artifact for project $terraformProject, artifact name: $terraformPlanArtifactName"
+        az pipelines runs artifact upload --artifact-name "$terraformPlanArtifactName" --path "$(realpath plan.tfplan)" --run-id "$(Build.BuildId)"
+
+        # check if an old project plan already exist
+        terraformProjectPlanValue=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformProjectPlanKey\"].value // empty")
+        if [ -n "$terraformProjectPlanValue" ]; then
+          variableGroupSubCommandLoop="update"
+        else
+          variableGroupSubCommandLoop="create"
+        fi
+        echo "$variableGroupSubCommandLoop terraform project plan in variable group $(variableGroupName) for project $terraformProject"
+        az pipelines variable-group variable $variableGroupSubCommandLoop --group-id "$variableGroupId" --name "$terraformProjectPlanKey" --value $terraformPlanArtifactName --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" > /dev/null
+
+        # call function to convert terraform output
+        messageToPullrequest+="$messageToPullrequestPrefix Plan succeeded:\n<pre>$(terraform show plan.tfplan)</pre>"
+      done
+      # verify if all projects plan succeeded
+      if $allPlanSucceeded; then
+        echo "all project plan succeeded"
+        messageToPullrequest="# Terraform plan success \n## terraform plan for all projects succeeded, you can run terraform apply pipe on this pull request .\n\n${messageToPullrequest}"
+      else
+        echo "one or more projects plan failed, run terraform plan again after fixing the issues" >&2
+        messageToPullrequest="# Terraform plan failure \n## one or more projects plan failed, check plan details before planning again.\n\n${messageToPullrequest}"
+      fi
+      # call upload_pr_comment_artifact function
+      upload_pr_comment_artifact "$messageToPullrequest"
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+      NONPROD_CLIENT_ID: $(ARM_CLIENT_ID)
+      NONPROD_TENANT_ID: $(ARM_TENANT_ID)
+      PROD_CLIENT_ID: $(ARM_CLIENT_ID)
+      PROD_TENANT_ID: $(ARM_TENANT_ID)
+    failOnStderr: true
+    displayName: 'Terraform plan for multiple projects'
+    name: 'terraform_plan_step'

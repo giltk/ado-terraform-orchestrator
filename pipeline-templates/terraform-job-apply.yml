@@ -1,0 +1,246 @@
+jobs:
+- job: terraform_apply
+  displayName: terraform apply
+  condition: eq(variables['commandVar'], 'apply' )
+  steps:
+  - checkout: self
+    persistCredentials: true
+
+  - script: |
+      ### functions ###
+      upload_pr_comment_artifact() {
+        local messageToPullrequest="$1"
+        # upload message to pull request artifact
+        echo "##vso[task.setvariable variable=messageToPullrequest;isoutput=true]True"
+        # create tmp file for artifact upload
+        echo "$messageToPullrequest" > $(messageToPullrequestArtifact)
+        az pipelines runs artifact upload --artifact-name "$(messageToPullrequestArtifact)" --path "$(realpath $(messageToPullrequestArtifact))" --run-id "$(Build.BuildId)"
+        # remove tmp file
+        rm $(messageToPullrequestArtifact)
+      }
+
+      ### PullRequest lock mechanism ###
+      # if pullRequestIdVar is not 0, then it was manually inputed - use that
+      if [ $(pullRequestIdVar) != "0" ]; then
+        pullRequestId=$(pullRequestIdVar)
+      else
+        pullRequestId=$(az repos pr list --repository "$(Build.Repository.Name)" --source-branch "$(sourceBranch)" --target-branch "$(targetBranch)" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --query "[0].pullRequestId" -o tsv)
+      fi
+
+      if [ -z $pullRequestId ]; then
+        echo "Pull request id not found, make sure there is an active PR for the source branch ($(sourceBranch))"
+        exit 1
+      fi
+
+      # publish variable for future jobs
+      echo "##vso[task.setvariable variable=pullRequestId;isoutput=true]$pullRequestId"
+
+      prMergeStatus=$(az repos pr show --id "$pullRequestId" --query 'mergeStatus' -o tsv)
+
+      if [ $prMergeStatus != "succeeded" ]; then
+        echo "Pull request is not in 'succeeded' merge status, fix merge issues"
+        messageToPullrequest="terraform apply Failed: Pull request merge status is not 'succeeded'"
+        # call upload_pr_comment_artifact function
+        upload_pr_comment_artifact "$messageToPullrequest"
+        exit 1
+      fi
+
+      # get correct variable group id from name:
+      variableGroupId=$(az pipelines variable-group list | jq -r ".[] | select(.name==\"$(variableGroupName)\") | .id")
+      if [ -z "$variableGroupId" ]; then
+        echo "Failed to retrieve variable group id, verify 'variableGroupName'"
+        messageToPullrequest="terraform apply Failed: failed to retrieve variable group id"
+        # call upload_pr_comment_artifact function
+        upload_pr_comment_artifact "$messageToPullrequest"
+        exit 1
+      fi
+
+      # get if repository is already locked
+      terraformRepoLockKey="terraform-$(Build.Repository.ID)-lock"
+      terraformRepoLockValue=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformRepoLockKey\"].value // empty")
+
+      if [ -n "$terraformRepoLockValue" ]; then
+        echo "existing terraform lock for repository was found, verifying PR lock" 
+        if [ "$terraformRepoLockValue" != "$pullRequestId" ]; then
+          echo "existing terraform plan belongs to a different PR, exiting pipeline"
+          messageToPullrequest="terraform apply Failed: This repository is currently locked by an unapplied plan from pull !$terraformRepoLockValue"
+          # call upload_pr_comment_artifact function
+          upload_pr_comment_artifact "$messageToPullrequest"
+          exit 1
+        else
+          echo "existing terraform projects plans were found, applying found plan files"
+        fi
+      else
+          echo "no existing terraform plan found, exiting pipeline"
+          messageToPullrequest="terraform apply Failed: This repository doesnt have an active plan."
+          # call upload_pr_comment_artifact function
+          upload_pr_comment_artifact "$messageToPullrequest"
+          exit 1
+      fi
+
+      terraformRepoProjectsKey="terraform-$(Build.Repository.ID)-projects"
+      terraformRepoProjectsValue=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformRepoProjectsKey\"].value // empty")
+
+      if [ -z $terraformRepoProjectsValue ]; then
+        echo "terraform projects names not found, make sure terraform plan generates plans"
+        messageToPullrequest="terraform apply Failed: This repository doesnt have active projects"
+        # call upload_pr_comment_artifact function
+        upload_pr_comment_artifact "$messageToPullrequest"
+        exit 1
+      fi
+      
+      # create an array from the concated terraform project string
+      IFS=';' read -ra projectList <<< "$terraformRepoProjectsValue"
+
+      # clone the array for later to verify if any projects were applied succesfully
+      clonedProjectList=("${projectList[@]}")
+
+      ### start projects loop ###
+      messageToPullrequest=""
+      allApplySucceeded=true
+      for index in "${!projectList[@]}"; do
+        # assign terraformProject its value
+        terraformProject="${projectList[$index]}"
+        echo "starting terraform project loop for project $terraformProject"
+        # add newlines to messageToPullrequest if it already holds data
+        if [ -n "$messageToPullrequest" ]; then
+          messageToPullrequest="${messageToPullrequest}\n\n"
+        fi
+        # prefix for the message in pull requests
+        messageToPullrequestPrefix="Ran plan for dir: \`$terraformProject\`.\n\n"
+
+        # init terraform variable group keys
+        terraformProjectPlanKey="terraform-$(Build.Repository.ID)-$terraformProject-plan"
+
+        echo "getting artifact name from variable group"
+        terraformPlanArtifactName=$(az pipelines variable-group show --group-id "$variableGroupId" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" | jq -r ".variables[\"$terraformProjectPlanKey\"].value // empty")
+        if [ -z "$terraformPlanArtifactName" ]; then
+            echo "didnt find terraform plan artifact for project, exiting pipeline"
+            messageToPullrequest+="${messageToPullrequestPrefix} Apply failed: Failed to retrieve terraform plan for project $terraformProject"
+            allApplySucceeded=false
+            continue
+        fi
+
+        echo "downloading terraform plan artifact"
+        # extracting from plan file path the run id/build id for the artifact command
+        artifactBuildId=$(echo "$terraformPlanArtifactName" | awk -F '-' '{print $NF}')
+        terraformProjectName=$(echo "$terraformProject" | awk -F/ '{print $NF}')
+        az pipelines runs artifact download --artifact-name "$terraformPlanArtifactName" --path "$terraformProject/artifact-$terraformProjectName" --run-id "$artifactBuildId"
+
+        # get the environment from the terraformProject
+        environment=$(echo "$terraformProject" | awk -F/ '{print $2}')
+        # use indirect referencing to get the correct client id and tenant and set them for terraform
+        clientIdVar="${environment^^}_CLIENT_ID"
+        tenantIdVar="${environment^^}_TENANT_ID"
+        export ARM_CLIENT_ID="${!clientIdVar}"
+        export ARM_TENANT_ID="${!tenantIdVar}"
+
+        # Set up a URL for the Azure DevOps API endpoint to get the OIDC token from
+        # Url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/distributedtask/hubs/build/plans/$(System.PlanId)/jobs/$(System.JobId)/oidctoken?serviceConnectionId=$(ADO_SERVICE_CONNECTION)&api-version=7.1-preview.1"
+        Url="$(System.CollectionUri)$(System.TeamProjectId)/_apis/distributedtask/hubs/build/plans/$(System.PlanId)/jobs/$(System.JobId)/oidctoken?api-version=7.1-preview.1"
+
+        # Get the OIDC token
+        response=$(curl -s -X POST -H "Authorization: Bearer $AZURE_DEVOPS_EXT_PAT" -H "Content-Type: application/json" --data '' "$Url")
+
+        OidcToken=$(echo "$response" | jq -r .oidcToken)
+
+        if [ -z "$OidcToken" ]; then
+          echo "Failed to retrieve OIDC token"
+          messageToPullrequest+="${messageToPullrequestPrefix} Apply failed: Failed to retrieve OIDC token"
+          allApplySucceeded=false
+          continue
+        fi
+
+        # export remaining terraform env
+        export ARM_USE_OIDC=true
+        export ARM_OIDC_TOKEN=$OidcToken
+
+        # changing directory to current project
+        cd $terraformProject
+
+        echo "performing terraform init for project $terraformProject"
+        commandOutput=$(terraform init 2>&1)
+        if [ $? -ne 0 ]; then
+          echo -e "error: terraform init failed:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Apply Failed: terraform init failed:\n<pre>${commandOutput}</pre>"
+          allApplySucceeded=false
+          continue
+        fi
+
+        echo "performing terraform apply for project $terraformProject"
+        commandOutput=$(terraform apply -auto-approve $(flagsVar) "artifact-$terraformProjectName/plan.tfplan" 2>&1)
+        if [ $? -ne 0 ]; then
+          echo -e "error: terraform apply failed:\n${commandOutput}"
+          messageToPullrequest+="$messageToPullrequestPrefix Apply Failed: terraform plan failed:\n<pre>${commandOutput}</pre>"
+          allApplySucceeded=false
+          continue
+        else
+          echo "apply succeeded, removing $terraformProject plan from variable group"
+          az pipelines variable-group variable delete --group-id "$variableGroupId" --name "$terraformProjectPlanKey" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --yes > /dev/null
+          # removing project from clonedProjectList because plan was applied succesfully
+          unset clonedProjectList[$index]
+          # call function to convert terraform output
+          messageToPullrequest+="$messageToPullrequestPrefix Apply succeeded:\n<pre>${commandOutput}</pre>"
+        fi
+
+        # output plan command if parameter is set
+        if $(terraformOutputToLogsVar); then
+          echo -e "terraform apply:\n\n$commandOutput"
+        fi
+
+        # change directory to the default working directory
+        cd $(System.DefaultWorkingDirectory)
+      done
+      # verify if all projects apply succeeded
+      if $allApplySucceeded; then
+        echo "all project apply succeeded, remove repository lock and repository projects"
+        # removing locks and projects variables
+        az pipelines variable-group variable delete --group-id "$variableGroupId" --name "$terraformRepoLockKey" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --yes > /dev/null
+        az pipelines variable-group variable delete --group-id "$variableGroupId" --name "$terraformRepoProjectsKey" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" --yes > /dev/null
+        messageToPullrequest="# Terraform apply success \n## terraform apply for all projects succeeded, you can safely merge the PR.\n\n${messageToPullrequest}"
+        # add auto completion to the pull request
+        echo "obtaining current build service id and adding auto completion to the Pull request"
+        url="$(System.CollectionUri)/_apis/connectionData?api-version=7.1-preview"
+        response=$(curl -s -L -w "%{http_code}" -H "Authorization: Bearer $AZURE_DEVOPS_EXT_PAT" -H "Content-Type: application/json" "$url")
+        http_code=${response: -3}
+        content=${response:0:-3}
+        if [ $http_code -ge "400" ] || [ $http_code -eq "000" ]; then
+            echo -e "curl error:\n${content}" >&2
+        fi
+        buildServiceID=$(echo "$content" | jq -r ".authenticatedUser.id // empty")
+        if [ -z $buildServiceID ]; then
+          echo "current build service id not found printing json content of request:\n${content})"
+          exit 1
+        fi
+        # sending patch request to update auto completion settings
+        url="$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/${pullRequestId}?api-version=7.1-preview"
+        body="{\"completionOptions\":{\"deleteSourceBranch\":true,\"mergeStrategy\":\"squash\",\"squashMerge\": true},\"autoCompleteSetBy\":{\"id\":\"${buildServiceID}\"}}"
+        response=$(curl -s -L -X PATCH -w "%{http_code}" -H "Authorization: Bearer $AZURE_DEVOPS_EXT_PAT" -H "Content-Type: application/json" --data "$body" "$url")
+        http_code=${response: -3}
+        content=${response:0:-3}
+        if [ $http_code -ge "400" ] || [ $http_code -eq "000" ]; then
+            echo -e "curl error:\n${content}" >&2
+        fi
+      else
+        echo "one or more projects apply failed, run terraform plan/apply again after fixing the issues" >&2
+
+        # check if clonedProjectList is the same as projectList
+        clonedProjectListConcat=$(printf "%s;" "${clonedProjectList[@]}")
+        # verify if the new 'clonedProjectListConcat' is different then what recieved from 'terraformRepoProjectsValue'
+        if [ "$terraformRepoProjectsValue" != "$clonedProjectListConcat" ]; then
+          # projects values are different, update new projects string
+          az pipelines variable-group variable update --group-id "$variableGroupId" --name "$terraformRepoProjectsKey" --value "$clonedProjectListConcat" --organization "$(System.CollectionUri)" --project "$(System.TeamProject)" > /dev/null
+        fi
+        messageToPullrequest="# Terraform apply failure \n## one or more projects apply failed, check apply details before applying again.\n\n${messageToPullrequest}"
+      fi 
+      # call upload_pr_comment_artifact function
+      upload_pr_comment_artifact "$messageToPullrequest"
+    env:
+      AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+      NONPROD_CLIENT_ID: $(ARM_CLIENT_ID)
+      NONPROD_TENANT_ID: $(ARM_TENANT_ID)
+      PROD_CLIENT_ID: $(ARM_CLIENT_ID)
+      PROD_TENANT_ID: $(ARM_TENANT_ID)
+    failOnStderr: true
+    displayName: 'Terraform apply for multiple projects'
+    name: 'terraform_apply_step'

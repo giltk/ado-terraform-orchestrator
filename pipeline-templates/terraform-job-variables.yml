@@ -1,0 +1,32 @@
+parameters:
+- name: command
+  type: string
+- name: flags
+  type: string
+- name: targetBranch
+  type: string
+- name: variableGroupName
+  type: string
+- name: terraformOutputToLogs
+  type: boolean
+- name: pullRequestId
+  type: number
+
+variables:
+- name: commandVar
+  value: ${{ parameters.command }}
+- name: flagsVar
+  value: ${{ parameters.flags }}
+- name: sourceBranch
+  value: $[coalesce(variables['System.PullRequest.SourceBranch'], variables['Build.SourceBranch'] )]
+- name: targetBranch
+  value: $[coalesce(variables['System.PullRequest.TargetBranch'], '${{ parameters.targetBranch }}' )]
+- name: variableGroupName
+  value: ${{ parameters.variableGroupName }}
+- name: terraformOutputToLogsVar
+  value: $[lower('${{ parameters.terraformOutputToLogs }}')]
+- name: messageToPullrequestArtifact
+  value: $[format('message-to-pullrequest-artifact-{0}', variables['Build.BuildId'] )]
+- name: pullRequestIdVar
+  value: ${{ parameters.pullRequestId }}
+

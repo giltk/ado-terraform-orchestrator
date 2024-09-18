@@ -1,0 +1,41 @@
+trigger: none
+
+parameters:
+- name: command
+  type: string
+  default: plan
+  values:
+    - plan
+    - unlock
+- name: flags
+  type: string
+  default: ' '
+- name: targetBranch
+  type: string
+  default: refs/heads/main
+- name: variableGroupName
+  type: string
+  default: terraform-locks
+- name: terraformOutputToLogs
+  type: boolean
+  default: false
+- name: pullRequestId
+  type: number
+  default: 0
+
+variables:
+  - template: /pipeline-templates/terraform-job-variables.yml
+    parameters:
+      command: ${{ parameters.command }}
+      flags: ${{ parameters.flags }}
+      targetBranch: ${{ parameters.targetBranch }}
+      variableGroupName: ${{ parameters.variableGroupName }}
+      terraformOutputToLogs: ${{ parameters.terraformOutputToLogs }}
+      pullRequestId: ${{ parameters.pullRequestId }}
+
+jobs:
+  - template: /pipeline-templates/terraform-job-plan.yml
+  - template: /pipeline-templates/terraform-job-apply.yml
+  - template: /pipeline-templates/terraform-job-unlock.yml
+  - template: /pipeline-templates/terraform-job-post-pr.yml
+
